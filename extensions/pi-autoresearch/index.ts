@@ -1275,13 +1275,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         let tempFileStream: ReturnType<typeof createWriteStream> | undefined;
         let totalBytes = 0;
 
+        // Cache for Buffer.concat — only rebuild when chunks change
+        let chunksGeneration = 0;
+        let cachedGeneration = -1;
+        let cachedText = "";
+
+        function getBufferText(): string {
+          if (cachedGeneration === chunksGeneration) return cachedText;
+          cachedText = Buffer.concat(chunks).toString("utf-8");
+          cachedGeneration = chunksGeneration;
+          return cachedText;
+        }
+
         // Timer interval — update every second with elapsed time + tail output
         const timerInterval = setInterval(() => {
           if (!onUpdate) return;
           const elapsed = formatElapsed(Date.now() - t0);
-          const fullBuffer = Buffer.concat(chunks);
-          const fullText = fullBuffer.toString("utf-8");
-          const trunc = truncateTail(fullText, {
+          const trunc = truncateTail(getBufferText(), {
             maxLines: DEFAULT_MAX_LINES,
             maxBytes: DEFAULT_MAX_BYTES,
           });
@@ -1320,6 +1330,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             const removed = chunks.shift()!;
             chunksBytes -= removed.length;
           }
+
+          chunksGeneration++;
         };
 
         if (child.stdout) child.stdout.on("data", handleData);
