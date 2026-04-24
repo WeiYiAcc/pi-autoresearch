@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { hasAutoresearchConfigHeader } from "./jsonl.ts";
+
 const TIMEOUT_MS = 30_000;
 const STDOUT_MAX_BYTES = 8 * 1024;
 const TRUNCATION_MARKER = "\n…[truncated: hook stdout exceeded 8KB]";
@@ -155,4 +157,29 @@ export function hookLogEntry(stage: HookStage, result: HookResult): Record<strin
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
     timed_out: result.timedOut,
   };
+}
+
+function hasConfigHeader(jsonlPath: string): boolean {
+  if (!fs.existsSync(jsonlPath)) return false;
+  try {
+    return hasAutoresearchConfigHeader(fs.readFileSync(jsonlPath, "utf-8"));
+  } catch {
+    return false;
+  }
+}
+
+export function appendHookLogEntryIfConfigured(
+  jsonlPath: string,
+  stage: HookStage,
+  result: HookResult,
+): boolean {
+  if (!result.fired) return false;
+  if (!hasConfigHeader(jsonlPath)) return false;
+
+  try {
+    fs.appendFileSync(jsonlPath, JSON.stringify(hookLogEntry(stage, result)) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
 }

@@ -35,12 +35,16 @@ import { tmpdir } from "node:os";
 import {
   runHook,
   steerMessageFor,
-  hookLogEntry,
-  type HookStage,
-  type HookResult,
+  appendHookLogEntryIfConfigured,
   type HookPayload,
   type SessionSnapshot,
-} from "./hooks.js";
+} from "./hooks.ts";
+import {
+  parseJsonlEntry,
+  isAutoresearchRunEntry,
+  extractAutoresearchSessionName,
+  reconstructJsonlState,
+} from "./jsonl.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -1146,20 +1150,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return fs.readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
   };
 
-  const parseRunEntry = (line: string): Record<string, unknown> | null => {
-    try {
-      const entry = JSON.parse(line);
-      return typeof entry.run === "number" ? entry : null;
-    } catch {
-      return null;
-    }
-  };
-
   const readLastRun = (workDir: string): Record<string, unknown> | null => {
     const lines = readJsonlLines(workDir);
     for (let i = lines.length - 1; i >= 0; i--) {
-      const entry = parseRunEntry(lines[i]);
-      if (entry) return entry;
+      const entry = parseJsonlEntry(lines[i]);
+      if (isAutoresearchRunEntry(entry)) return entry;
     }
     return null;
   };
@@ -1174,17 +1169,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     goal: state.name ?? "",
   });
 
-  const appendHookLogEntry = (workDir: string, stage: HookStage, result: HookResult): void => {
-    if (!result.fired) return;
-    try {
-      const jsonlPath = autoresearchJsonlPath(workDir);
-      fs.appendFileSync(jsonlPath, JSON.stringify(hookLogEntry(stage, result)) + "\n");
-    } catch {}
-  };
-
   const fireHook = async (payload: HookPayload): Promise<string | null> => {
     const result = await runHook(payload);
-    appendHookLogEntry(payload.cwd, payload.event, result);
+    appendHookLogEntryIfConfigured(autoresearchJsonlPath(payload.cwd), payload.event, result);
     return steerMessageFor(payload.event, result);
   };
 
@@ -1252,63 +1239,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     let loadedFromJsonl = false;
     try {
       if (fs.existsSync(jsonlPath)) {
-        let segment = 0;
-        const lines = fs.readFileSync(jsonlPath, "utf-8").trim().split("\n").filter(Boolean);
-        for (const line of lines) {
-          try {
-            const entry = JSON.parse(line);
+        const reconstructed = reconstructJsonlState(fs.readFileSync(jsonlPath, "utf-8"));
+        state.name = reconstructed.name;
+        state.metricName = reconstructed.metricName;
+        state.metricUnit = reconstructed.metricUnit;
+        state.bestDirection = reconstructed.bestDirection;
+        state.currentSegment = reconstructed.currentSegment;
+        state.results = reconstructed.results.map((result) => ({
+          ...result,
+          metrics: { ...result.metrics },
+        }));
+        state.secondaryMetrics = reconstructed.secondaryMetrics.map((metric) => ({ ...metric }));
+        runtime.iterationTokenHistory = [...reconstructed.iterationTokenHistory];
 
-            // Config header line — each header starts a new segment
-            if (entry.type === "config") {
-              if (entry.name) state.name = entry.name;
-              if (entry.metricName) state.metricName = entry.metricName;
-              if (entry.metricUnit !== undefined) state.metricUnit = entry.metricUnit;
-              if (entry.bestDirection) state.bestDirection = entry.bestDirection;
-              // Increment segment (first config = 0, second = 1, etc.)
-              if (state.results.length > 0) {
-                segment++;
-                // Reset per-segment tracking (mirrors live reinit behavior)
-                state.secondaryMetrics = [];
-              }
-              state.currentSegment = segment;
-              continue;
-            }
-
-            // Experiment result line
-            const iterationTokens = entry.iterationTokens ?? null;
-            state.results.push({
-              commit: entry.commit ?? "",
-              metric: entry.metric ?? 0,
-              metrics: entry.metrics ?? {},
-              status: entry.status ?? "keep",
-              description: entry.description ?? "",
-              timestamp: entry.timestamp ?? 0,
-              segment,
-              confidence: entry.confidence ?? null,
-              iterationTokens,
-              asi: entry.asi ?? undefined,
-            });
-
-            if (typeof iterationTokens === "number" && iterationTokens > 0) {
-              runtime.iterationTokenHistory.push(iterationTokens);
-            }
-
-            // Register secondary metrics
-            for (const name of Object.keys(entry.metrics ?? {})) {
-              if (!state.secondaryMetrics.find((m) => m.name === name)) {
-                let unit = "";
-                if (name.endsWith("µs")) unit = "µs";
-                else if (name.endsWith("_ms")) unit = "ms";
-                else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
-                else if (name.endsWith("_kb")) unit = "kb";
-                else if (name.endsWith("_mb")) unit = "mb";
-                state.secondaryMetrics.push({ name, unit });
-              }
-            }
-          } catch {
-            // Skip malformed lines
-          }
-        }
         if (state.results.length > 0) {
           loadedFromJsonl = true;
           state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
@@ -2825,17 +2768,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return fs.readFileSync(autoresearchJsonlPath(workDir), "utf-8").trim();
   }
 
-  function extractSessionName(jsonlContent: string): string {
-    const firstLine = jsonlContent.split("\n").find((l) => l.trim());
-    if (!firstLine) return "Autoresearch";
-    try {
-      const config = JSON.parse(firstLine);
-      return config.name || "Autoresearch";
-    } catch {
-      return "Autoresearch";
-    }
-  }
-
   function escapeHtml(text: string): string {
     return text
       .replace(/&/g, "&amp;")
@@ -2888,7 +2820,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   function writeDashboardFile(workDir: string): string {
     const jsonlContent = readJsonlContent(workDir);
-    const sessionName = extractSessionName(jsonlContent);
+    const sessionName = extractAutoresearchSessionName(jsonlContent);
     const html = injectDataIntoTemplate(readTemplate(), sessionName)
       .replace(LOGO_PLACEHOLDER, logoDataUrl());
     const exportDir = fs.mkdtempSync(path.join(tmpdir(), "pi-autoresearch-dashboard-"));
